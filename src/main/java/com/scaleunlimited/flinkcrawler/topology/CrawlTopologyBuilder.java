@@ -1,5 +1,6 @@
 package com.scaleunlimited.flinkcrawler.topology;
 
+import java.io.IOException;
 import java.net.MalformedURLException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -8,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.java.hadoop.mapreduce.HadoopOutputFormat;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.core.fs.FileSystem.WriteMode;
@@ -21,6 +23,9 @@ import org.apache.flink.streaming.api.datastream.SplitStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.mapreduce.Job;
 
 import com.scaleunlimited.flinkcrawler.fetcher.BaseHttpFetcherBuilder;
 import com.scaleunlimited.flinkcrawler.fetcher.SimpleHttpFetcherBuilder;
@@ -36,6 +41,9 @@ import com.scaleunlimited.flinkcrawler.functions.ParseSiteMapFunction;
 import com.scaleunlimited.flinkcrawler.functions.PldKeySelector;
 import com.scaleunlimited.flinkcrawler.functions.UrlDBFunction;
 import com.scaleunlimited.flinkcrawler.functions.ValidUrlsFilter;
+import com.scaleunlimited.flinkcrawler.io.CreateWARCWritableFunction;
+import com.scaleunlimited.flinkcrawler.io.WARCOutputFormat;
+import com.scaleunlimited.flinkcrawler.io.WARCWritable;
 import com.scaleunlimited.flinkcrawler.parser.BasePageParser;
 import com.scaleunlimited.flinkcrawler.parser.SimplePageParser;
 import com.scaleunlimited.flinkcrawler.parser.SimpleSiteMapParser;
@@ -84,8 +92,9 @@ public class CrawlTopologyBuilder {
     private SimpleRobotRulesParser _robotsParser = new SimpleRobotRulesParser();
 
     private BaseUrlLengthener _urlLengthener = new SimpleUrlLengthener(INVALID_USER_AGENT, 1);
-    private SinkFunction<ParsedUrl> _contentSink = new DiscardingSink<ParsedUrl>();
+    private SinkFunction<Tuple2<NullWritable, WARCWritable>> _contentSink;
     private SinkFunction<String> _contentTextSink;
+    private String _contentFilePathString;
     private String _contentTextFilePathString;
     private BaseUrlNormalizer _urlNormalizer = new SimpleUrlNormalizer();
     private BaseUrlValidator _urlFilter = new SimpleUrlValidator();
@@ -175,8 +184,19 @@ public class CrawlTopologyBuilder {
         return this;
     }
 
-    public CrawlTopologyBuilder setContentSink(SinkFunction<ParsedUrl> contentSink) {
+    public CrawlTopologyBuilder setContentSink(SinkFunction<Tuple2<NullWritable, WARCWritable>> contentSink) {
+        if (_contentFilePathString != null) {
+            throw new IllegalArgumentException("already have a content file path");
+        }
         _contentSink = contentSink;
+        return this;
+    }
+
+    public CrawlTopologyBuilder setContentFile(String filePathString) {
+        if (_contentSink != null) {
+            throw new IllegalArgumentException("already have a content sink");
+        }
+        _contentFilePathString = filePathString;
         return this;
     }
 
@@ -419,7 +439,7 @@ public class CrawlTopologyBuilder {
 
         // Save off parsed page content. So just extract the parsed content piece of the Tuple3, and
         // then pass it on to the provided content sink function.
-        outlinksOrContent.select("content")
+        DataStream<ParsedUrl> parsedUrls = outlinksOrContent.select("content")
                 .map(new MapFunction<Tuple3<ExtractedUrl, ParsedUrl, String>, ParsedUrl>() {
 
                     @Override
@@ -428,11 +448,35 @@ public class CrawlTopologyBuilder {
                         return in.f1;
                     }
                 })
-                .setParallelism(parseParallelism)
                 .name("Select fetched content")
-                .addSink(_contentSink)
-                .name("ContentSink")
                 .setParallelism(parseParallelism);
+        
+        DataStream<Tuple2<NullWritable, WARCWritable>> content = parsedUrls.flatMap(new CreateWARCWritableFunction())
+                .name("Convert ParsedUrl to WARCWritable")
+                .setParallelism(parseParallelism);
+        
+        DataStreamSink<Tuple2<NullWritable, WARCWritable>> contentSink = null;
+        if (_contentSink != null) {
+            contentSink = content.addSink(_contentSink);
+        } else if (_contentFilePathString != null) {
+            // Set up Hadoop Output Format
+            Job job;
+            try {
+                job = Job.getInstance();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            HadoopOutputFormat<NullWritable, WARCWritable> hadoopOutputFormat = new HadoopOutputFormat<NullWritable, WARCWritable>(
+                    new WARCOutputFormat(), job);
+            WARCOutputFormat.setOutputPath(job, new Path(_contentFilePathString));
+            // Output & Execute
+            contentSink = content.writeUsingOutputFormat(hadoopOutputFormat);
+        } else {
+            // TODO Error!
+        }
+        
+        contentSink.name("ContentSink").setParallelism(parseParallelism);
+
 
         // Save off parsed page content text. So just extract the parsed content text piece of the Tuple3, and
         // then pass it on to the provided content sink function (or just send it to the console).
@@ -447,17 +491,16 @@ public class CrawlTopologyBuilder {
                 .name("Select fetched content text")
                 .setParallelism(parseParallelism);
         
-        DataStreamSink<String> contentSink;
+        DataStreamSink<String> contentTextSink;
         if (_contentTextSink != null) {
-            contentSink = contentText.addSink(_contentTextSink);
+            contentTextSink = contentText.addSink(_contentTextSink);
         } else if (_contentTextFilePathString != null) {
-            contentSink = contentText.writeAsText(_contentTextFilePathString, WriteMode.OVERWRITE);
+            contentTextSink = contentText.writeAsText(_contentTextFilePathString, WriteMode.OVERWRITE);
         } else {
-            contentSink = contentText.print();
+            contentTextSink = contentText.print();
         }
         
-        contentSink.name("ContentTextSink")
-        .setParallelism(parseParallelism);
+        contentTextSink.name("ContentTextSink").setParallelism(parseParallelism);
 
         return new CrawlTopology(_env, _jobName);
     }
